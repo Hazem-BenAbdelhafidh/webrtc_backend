@@ -106,9 +106,7 @@ async def offer(sid, data):
 
     # Create PC for the caller on the server
     # Initialize PC and Receiver Transceiver
-    pc = RTCPeerConnection(configuration=RTCConfiguration(
-        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-    ))
+    pc = RTCPeerConnection()
     call["pcs"][sid] = pc
     # Add a transceiver to receive and send audio
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
@@ -240,9 +238,7 @@ async def accept_call(sid, data):
     call_manager.sid_to_call[sid] = call_id
 
     # Initialize Callee's PC
-    pc = RTCPeerConnection(configuration=RTCConfiguration(
-        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-    ))
+    pc = RTCPeerConnection()
     call["pcs"][sid] = pc
     # Add a transceiver to receive and send audio
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
