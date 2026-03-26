@@ -6,7 +6,7 @@ from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
-from aiortc.contrib.media import MediaRelay, MediaRecorder
+from aiortc.contrib.media import MediaRelay  # , MediaRecorder
 
 relay = MediaRelay()
 
@@ -36,12 +36,12 @@ class CallManager:
             call = self.calls.pop(call_id)
 
             # Stop recorder if active
-            if call["recorder"]:
-                try:
-                    await call["recorder"].stop()
-                    print(f"Recording for {call_id} saved.")
-                except Exception as e:
-                    print(f"Error stopping recorder: {e}")
+            # if call["recorder"]:
+            #     try:
+            #         await call["recorder"].stop()
+            #         print(f"Recording for {call_id} saved.")
+            #     except Exception as e:
+            #         print(f"Error stopping recorder: {e}")
 
             for sid, pc in list(call["pcs"].items()):
                 await pc.close()
