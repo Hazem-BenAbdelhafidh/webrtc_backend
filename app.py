@@ -1,5 +1,6 @@
 import logging
 import json
+import os
 import asyncio
 from aiohttp import web
 import socketio
@@ -106,7 +107,9 @@ async def offer(sid, data):
 
     # Create PC for the caller on the server
     # Initialize PC and Receiver Transceiver
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(configuration=RTCConfiguration(
+        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+    ))
     call["pcs"][sid] = pc
     # Add a transceiver to receive and send audio
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
@@ -140,7 +143,7 @@ async def offer(sid, data):
         # Add track to recorder
         if not call["recorder"]:
             call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(track)
+        call["recorder"].addTrack(relay.subscribe(track))
         if not call["recording_started"]:
             await call["recorder"].start()
             call["recording_started"] = True
@@ -238,7 +241,9 @@ async def accept_call(sid, data):
     call_manager.sid_to_call[sid] = call_id
 
     # Initialize Callee's PC
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(configuration=RTCConfiguration(
+        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+    ))
     call["pcs"][sid] = pc
     # Add a transceiver to receive and send audio
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
@@ -270,7 +275,7 @@ async def accept_call(sid, data):
         # Add track to recorder
         if not call["recorder"]:
             call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-            call["recorder"].addTrack(track)
+        call["recorder"].addTrack(relay.subscribe(track))
         if not call["recording_started"]:
             await call["recorder"].start()
             call["recording_started"] = True
@@ -338,5 +343,5 @@ async def upload_recording(request):
 app.router.add_post('/upload-recording', upload_recording)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    web.run_app(app, port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    web.run_app(app, port=port)
