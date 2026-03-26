@@ -1,9 +1,10 @@
 import logging
 from aiohttp import web
 import socketio
+import os
 
 sio = socketio.AsyncServer(
-    async_mode='aiohttp', 
+    async_mode='aiohttp',
     cors_allowed_origins='*',
     max_http_buffer_size=10000000 # 10MB
 )
@@ -33,7 +34,7 @@ async def register(sid, data):
     number = str(data.get("number"))
     if not number:
         return {"error": "Number is required"}
-    
+
     users[number] = sid
     sid_to_number[sid] = number
     print(f"User {number} registered with sid {sid}")
@@ -44,7 +45,7 @@ async def offer(sid, data):
     target_number = str(data.get("destination"))
     caller_number = sid_to_number.get(sid, "Unknown")
     print(f"Offer from {caller_number} to {target_number}")
-    
+
     if target_number in users:
         target_sid = users[target_number]
         data["caller"] = caller_number
@@ -57,7 +58,7 @@ async def offer(sid, data):
 async def answer(sid, data):
     target_number = str(data.get("destination"))
     print(f"Answer for {target_number} from {sid_to_number.get(sid)}")
-    
+
     if target_number in users:
         target_sid = users[target_number]
         await sio.emit("answer", data, to=target_sid)
@@ -99,4 +100,5 @@ app.router.add_post('/upload-recording', upload_recording)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    web.run_app(app, port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    web.run_app(app, port=port)
