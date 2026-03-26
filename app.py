@@ -140,7 +140,7 @@ async def offer(sid, data):
         # Add track to recorder
         if not call["recorder"]:
             call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
+        call["recorder"].addTrack(track)
         if not call["recording_started"]:
             await call["recorder"].start()
             call["recording_started"] = True
@@ -270,7 +270,7 @@ async def accept_call(sid, data):
         # Add track to recorder
         if not call["recorder"]:
             call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
+            call["recorder"].addTrack(track)
         if not call["recording_started"]:
             await call["recorder"].start()
             call["recording_started"] = True
