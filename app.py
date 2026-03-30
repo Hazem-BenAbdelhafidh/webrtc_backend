@@ -14,12 +14,19 @@ relay = MediaRelay()
 # ---------------------------------------------------------------------------
 
 def _make_pc() -> RTCPeerConnection:
-    """Create a PeerConnection with STUN server for NAT traversal."""
+    """Create a PeerConnection with no ICE servers on the server side.
+
+    The server has a known public IP so host candidates are sufficient and
+    skipping STUN removes one full round-trip of gathering delay.
+    Add a TURN server here only if your server is behind NAT.
+    """
     return RTCPeerConnection(
         configuration=RTCConfiguration(
-            iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+            iceServers=[]
+            # iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
         )
     )
+
 
 # ---------------------------------------------------------------------------
 # Call Manager
@@ -37,9 +44,9 @@ class CallManager:
             self.calls[call_id] = {
                 "caller_num": caller_num,
                 "callee_num": callee_num,
-                "pcs": {},      # sid -> RTCPeerConnection
-                "senders": {},  # sid -> RTCRtpSender
-                "tracks": {},   # number -> MediaStreamTrack
+                "pcs": {},      # sid    -> RTCPeerConnection
+                "senders": {},  # sid    -> RTCRtpSender
+                "tracks": {},   # number -> subscribed MediaStreamTrack
             }
         return call_id, self.calls[call_id]
 
@@ -48,12 +55,10 @@ class CallManager:
             return
         call = self.calls.pop(call_id)
         for sid, pc in list(call["pcs"].items()):
-            try:
-                await pc.close()
-            except Exception as e:
-                print(f"[call] error closing pc {sid}: {e}")
+            await pc.close()
             self.sid_to_call.pop(sid, None)
         print(f"[call] {call_id} closed.")
+
 
 call_manager = CallManager()
 
@@ -70,7 +75,8 @@ app = web.Application()
 sio.attach(app)
 
 users: dict = {}         # number -> sid
-sid_to_number: dict = {} # sid -> number
+sid_to_number: dict = {} # sid    -> number
+
 
 # ---------------------------------------------------------------------------
 # Connection lifecycle
@@ -79,6 +85,7 @@ sid_to_number: dict = {} # sid -> number
 @sio.event
 async def connect(sid, environ):
     print(f"[ws] connected  {sid}")
+
 
 @sio.event
 async def disconnect(sid):
@@ -91,6 +98,7 @@ async def disconnect(sid):
         users.pop(number, None)
         print(f"[reg] {number} unregistered.")
 
+
 @sio.on("register")
 async def register(sid, data):
     number = str(data.get("number", ""))
@@ -101,8 +109,9 @@ async def register(sid, data):
     print(f"[reg] {number} → {sid}")
     return {"status": "ok"}
 
+
 # ---------------------------------------------------------------------------
-# PeerConnection setup
+# Shared helper: wire up a fresh PeerConnection for one participant
 # ---------------------------------------------------------------------------
 
 async def _setup_pc_for_peer(
@@ -113,6 +122,16 @@ async def _setup_pc_for_peer(
     call: dict,
     initial_track=None,
 ):
+    """
+    Create and fully configure a PeerConnection for `peer_number`.
+
+    Latency optimisations:
+      - Transceiver added before offer/answer so SDP already declares the
+        send direction — no renegotiation needed when the track arrives.
+      - If the other peer's track already exists it is loaded into the sender
+        immediately so the very first SDP exchange carries live audio.
+      - Tracks are forwarded with buffered=False (no relay jitter buffer).
+    """
     pc = _make_pc()
     call["pcs"][sid] = pc
     call_manager.sid_to_call[sid] = call_id
@@ -120,7 +139,7 @@ async def _setup_pc_for_peer(
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
     call["senders"][sid] = transceiver.sender
 
-    # only replace track if we have one
+    # Pre-load the remote peer's track if already available
     if initial_track is not None:
         await transceiver.sender.replaceTrack(initial_track)
 
@@ -145,21 +164,22 @@ async def _setup_pc_for_peer(
     @pc.on("track")
     async def on_track(track):
         print(f"[track] received from {peer_number}")
+
+        # buffered=False → frames forwarded immediately, no jitter queue
         subscribed = relay.subscribe(track, buffered=False)
         call["tracks"][peer_number] = subscribed
 
         # Push this peer's track to every other peer's sender right away
         for peer_sid, peer_sender in list(call["senders"].items()):
             if peer_sid != sid:
-                try:
-                    await peer_sender.replaceTrack(subscribed)
-                except Exception as e:
-                    print(f"[track] error forwarding to {sid_to_number.get(peer_sid)}: {e}")
+                await peer_sender.replaceTrack(subscribed)
+                print(f"[track] forwarded to {sid_to_number.get(peer_sid)}")
 
     return pc
 
+
 # ---------------------------------------------------------------------------
-# offer
+# offer  (caller -> server)
 # ---------------------------------------------------------------------------
 
 @sio.on("offer")
@@ -174,6 +194,7 @@ async def offer(sid, data):
     print(f"[offer] {caller_number} → {target_number}")
 
     call_id, call = call_manager.get_or_create_call(caller_number, target_number)
+
     callee_track = call["tracks"].get(target_number)
     pc = await _setup_pc_for_peer(
         sid, caller_number, target_number, call_id, call,
@@ -195,6 +216,7 @@ async def offer(sid, data):
         to=sid,
     )
 
+    # Notify callee if online
     if target_number in users:
         target_sid = users[target_number]
         if target_sid not in call["pcs"]:
@@ -203,8 +225,9 @@ async def offer(sid, data):
         print(f"[offer] target {target_number} offline")
         await sio.emit("call-failed", {"reason": "User offline"}, to=sid)
 
+
 # ---------------------------------------------------------------------------
-# answer
+# answer  (callee -> server, after server sent offer to callee)
 # ---------------------------------------------------------------------------
 
 @sio.on("answer")
@@ -224,6 +247,7 @@ async def answer(sid, data):
     pc = call["pcs"].get(sid)
     if pc:
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
+
 
 # ---------------------------------------------------------------------------
 # ice-candidate
@@ -252,8 +276,9 @@ async def ice_candidate(sid, data):
         except Exception as e:
             print(f"[ice] error: {e}")
 
+
 # ---------------------------------------------------------------------------
-# accept-call
+# accept-call  (callee accepts -> server creates callee's PC and sends offer)
 # ---------------------------------------------------------------------------
 
 @sio.on("accept-call")
@@ -264,8 +289,8 @@ async def accept_call(sid, data):
     print(f"[accept] {callee_number} accepted from {caller_number}")
 
     call_id, call = call_manager.get_or_create_call(caller_number, callee_number)
-    caller_track = call["tracks"].get(caller_number)
 
+    caller_track = call["tracks"].get(caller_number)
     pc = await _setup_pc_for_peer(
         sid, callee_number, caller_number, call_id, call,
         initial_track=caller_track,
@@ -287,6 +312,7 @@ async def accept_call(sid, data):
     if caller_number in users:
         await sio.emit("call-accepted", {"callee": callee_number}, to=users[caller_number])
 
+
 # ---------------------------------------------------------------------------
 # end-call
 # ---------------------------------------------------------------------------
@@ -300,6 +326,7 @@ async def end_call(sid, data):
         await call_manager.close_call(call_id)
     if target_number in users:
         await sio.emit("end-call", {"caller": caller_number}, to=users[target_number])
+
 
 # ---------------------------------------------------------------------------
 
