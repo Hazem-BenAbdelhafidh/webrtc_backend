@@ -1,304 +1,321 @@
-import logging
-import json
 import os
 import asyncio
 from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
-from aiortc.contrib.media import MediaRelay, MediaRecorder
+from aiortc.contrib.media import MediaRelay
 
+# Single relay instance — buffered=False keeps forwarding latency minimal
 relay = MediaRelay()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_pc() -> RTCPeerConnection:
+    """Create a PeerConnection with no ICE servers on the server side.
+
+    The server has a known public IP so host candidates are sufficient and
+    skipping STUN removes one full round-trip of gathering delay.
+    Add a TURN server here only if your server is behind NAT.
+    """
+    return RTCPeerConnection(
+        configuration=RTCConfiguration(
+            iceServers=[]
+            # iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# Call Manager
+# ---------------------------------------------------------------------------
 
 class CallManager:
     def __init__(self):
-        self.calls = {} # type: dict
-        self.sid_to_call = {} # type: dict
+        self.calls: dict = {}
+        self.sid_to_call: dict = {}
 
     def get_or_create_call(self, caller_num: str, callee_num: str):
-        # Ensure consistent call_id regardless of who calls whom
         nums = sorted([caller_num, callee_num])
         call_id = f"{nums[0]}-{nums[1]}"
         if call_id not in self.calls:
             self.calls[call_id] = {
                 "caller_num": caller_num,
                 "callee_num": callee_num,
-                "pcs": {}, # sid -> pc
-                "senders": {}, # sid -> sender
-                "tracks": {}, # number -> track
-                "recorder": None,
-                "recording_started": False
+                "pcs": {},      # sid    -> RTCPeerConnection
+                "senders": {},  # sid    -> RTCRtpSender
+                "tracks": {},   # number -> subscribed MediaStreamTrack
             }
         return call_id, self.calls[call_id]
 
     async def close_call(self, call_id: str):
-        if call_id in self.calls:
-            call = self.calls.pop(call_id)
+        if call_id not in self.calls:
+            return
+        call = self.calls.pop(call_id)
+        for sid, pc in list(call["pcs"].items()):
+            await pc.close()
+            self.sid_to_call.pop(sid, None)
+        print(f"[call] {call_id} closed.")
 
-            # Stop recorder if active
-            if call["recorder"]:
-                try:
-                    await call["recorder"].stop()
-                    print(f"Recording for {call_id} saved.")
-                except Exception as e:
-                    print(f"Error stopping recorder: {e}")
-
-            for sid, pc in list(call["pcs"].items()):
-                await pc.close()
-                self.sid_to_call.pop(sid, None)
-            print(f"Call {call_id} closed.")
 
 call_manager = CallManager()
 
+# ---------------------------------------------------------------------------
+# Socket.IO / aiohttp app
+# ---------------------------------------------------------------------------
+
 sio = socketio.AsyncServer(
-    async_mode='aiohttp',
-    cors_allowed_origins='*',
-    max_http_buffer_size=10000000 # 10MB
+    async_mode="aiohttp",
+    cors_allowed_origins="*",
+    max_http_buffer_size=10_000_000,
 )
 app = web.Application()
 sio.attach(app)
 
-# Mapping from phone number -> sid
-users = {}
-# Mapping from sid -> phone number
-sid_to_number = {}
+users: dict = {}         # number -> sid
+sid_to_number: dict = {} # sid    -> number
+
+
+# ---------------------------------------------------------------------------
+# Connection lifecycle
+# ---------------------------------------------------------------------------
 
 @sio.event
 async def connect(sid, environ):
-    print(f"Client connected: {sid}")
+    print(f"[ws] connected  {sid}")
+
 
 @sio.event
 async def disconnect(sid):
-    print(f"Client disconnected: {sid}")
+    print(f"[ws] disconnected {sid}")
     if sid in call_manager.sid_to_call:
         call_id = call_manager.sid_to_call[sid]
         await call_manager.close_call(call_id)
-
     if sid in sid_to_number:
         number = sid_to_number.pop(sid)
-        if number in users:
-            users.pop(number, None)
-        print(f"User {number} unregistered.")
+        users.pop(number, None)
+        print(f"[reg] {number} unregistered.")
+
 
 @sio.on("register")
 async def register(sid, data):
-    number = str(data.get("number"))
+    number = str(data.get("number", ""))
     if not number:
-        return {"error": "Number is required"}
-
+        return {"error": "number required"}
     users[number] = sid
     sid_to_number[sid] = number
-    print(f"User {number} registered with sid {sid}")
+    print(f"[reg] {number} → {sid}")
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Shared helper: wire up a fresh PeerConnection for one participant
+# ---------------------------------------------------------------------------
+
+async def _setup_pc_for_peer(
+    sid: str,
+    peer_number: str,
+    other_number: str,
+    call_id: str,
+    call: dict,
+    initial_track=None,
+):
+    """
+    Create and fully configure a PeerConnection for `peer_number`.
+
+    Latency optimisations:
+      - Transceiver added before offer/answer so SDP already declares the
+        send direction — no renegotiation needed when the track arrives.
+      - If the other peer's track already exists it is loaded into the sender
+        immediately so the very first SDP exchange carries live audio.
+      - Tracks are forwarded with buffered=False (no relay jitter buffer).
+    """
+    pc = _make_pc()
+    call["pcs"][sid] = pc
+    call_manager.sid_to_call[sid] = call_id
+
+    transceiver = pc.addTransceiver("audio", direction="sendrecv")
+    call["senders"][sid] = transceiver.sender
+
+    # Pre-load the remote peer's track if already available
+    if initial_track is not None:
+        await transceiver.sender.replaceTrack(initial_track)
+
+    # ---- ICE candidates ------------------------------------------------
+    @pc.on("icecandidate")
+    async def on_icecandidate(candidate):
+        if candidate:
+            await sio.emit(
+                "ice-candidate",
+                {
+                    "candidate": {
+                        "candidate": candidate.candidate,
+                        "sdpMid": candidate.sdpMid,
+                        "sdpMLineIndex": candidate.sdpMLineIndex,
+                    },
+                    "destination": peer_number,
+                },
+                to=sid,
+            )
+
+    # ---- Incoming track from this peer ---------------------------------
+    @pc.on("track")
+    async def on_track(track):
+        print(f"[track] received from {peer_number}")
+
+        # buffered=False → frames forwarded immediately, no jitter queue
+        subscribed = relay.subscribe(track, buffered=False)
+        call["tracks"][peer_number] = subscribed
+
+        # Push this peer's track to every other peer's sender right away
+        for peer_sid, peer_sender in list(call["senders"].items()):
+            if peer_sid != sid:
+                await peer_sender.replaceTrack(subscribed)
+                print(f"[track] forwarded to {sid_to_number.get(peer_sid)}")
+
+    return pc
+
+
+# ---------------------------------------------------------------------------
+# offer  (caller -> server)
+# ---------------------------------------------------------------------------
 
 @sio.on("offer")
 async def offer(sid, data):
-    target_number = str(data.get("destination"))
     caller_number = sid_to_number.get(sid)
+    target_number = str(data.get("destination", ""))
     sdp = data.get("sdp")
 
     if not caller_number or not target_number:
         return
 
-    print(f"Offer from {caller_number} to {target_number}")
+    print(f"[offer] {caller_number} → {target_number}")
 
     call_id, call = call_manager.get_or_create_call(caller_number, target_number)
-    call_manager.sid_to_call[sid] = call_id
 
-    # Create PC for the caller on the server
-    # Initialize PC and Receiver Transceiver
-    pc = RTCPeerConnection(configuration=RTCConfiguration(
-        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-    ))
-    call["pcs"][sid] = pc
-    # Add a transceiver to receive and send audio
-    transceiver = pc.addTransceiver("audio", direction="sendrecv")
-    call["senders"][sid] = transceiver.sender
+    callee_track = call["tracks"].get(target_number)
+    pc = await _setup_pc_for_peer(
+        sid, caller_number, target_number, call_id, call,
+        initial_track=callee_track,
+    )
 
-    # If the callee has already shared their track, add it to this sender
-    callee_number = call["callee_num"]
-    if callee_number in call["tracks"]:
-        print(f"Adding callee's track to caller's PC initial bundle")
-        transceiver.sender.replaceTrack(call["tracks"][callee_number])
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
 
-    @pc.on("icecandidate")
-    async def on_icecandidate(candidate):
-        if candidate:
-            print(f"Server ICE candidate for {caller_number}")
-            await sio.emit("ice-candidate", {
-                "candidate": {
-                    "candidate": candidate.candidate,
-                    "sdpMid": candidate.sdpMid,
-                    "sdpMLineIndex": candidate.sdpMLineIndex
-                },
-                "destination": caller_number
-            }, to=sid)
-
-    @pc.on("track")
-    async def on_track(track): # Change to async
-        print(f"Received track from {caller_number}")
-        subscribed_track = relay.subscribe(track)
-        call["tracks"][caller_number] = subscribed_track
-
-        # Add track to recorder
-        if not call["recorder"]:
-            call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
-        if not call["recording_started"]:
-            await call["recorder"].start()
-            call["recording_started"] = True
-
-        # Forward caller's track to all other peers via their existing senders
-        for peer_sid, peer_sender in list(call["senders"].items()):
-            if peer_sid != sid:
-                print(f"Replacing track for peer {sid_to_number.get(peer_sid)} with caller's track")
-                await peer_sender.replaceTrack(subscribed_track)
-                # No offer/answer needed for replaceTrack in aiortc usually,
-                # but if the client hasn't connected yet, the initial offer will handle it.
-
-    # Set remote description
-    offer = RTCSessionDescription(sdp=sdp, type="offer")
-    await pc.setRemoteDescription(offer)
-
-    # Create answer
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    print(f"Generated answer for {caller_number}: {pc.localDescription.sdp[:100]}...")
 
-    # Return answer to caller
-    await sio.emit("answer", {
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type,
-        "destination": caller_number
-    }, to=sid)
+    await sio.emit(
+        "answer",
+        {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "destination": caller_number,
+        },
+        to=sid,
+    )
 
-    # Notify callee if they are online
+    # Notify callee if online
     if target_number in users:
         target_sid = users[target_number]
-        # Check if we need to initiate a connection to the callee
         if target_sid not in call["pcs"]:
-            print(f"Initiating connection to callee {target_number}")
             await sio.emit("incoming-call", {"caller": caller_number}, to=target_sid)
     else:
-        print(f"Target {target_number} not found.")
+        print(f"[offer] target {target_number} offline")
         await sio.emit("call-failed", {"reason": "User offline"}, to=sid)
+
+
+# ---------------------------------------------------------------------------
+# answer  (callee -> server, after server sent offer to callee)
+# ---------------------------------------------------------------------------
 
 @sio.on("answer")
 async def answer(sid, data):
-    # This handler is called when the CALLEE sends their answer back to the server
-    caller_number = str(data.get("destination")) # The server is the destination for the callee's answer
     callee_number = sid_to_number.get(sid)
+    caller_number = str(data.get("destination", ""))
     sdp = data.get("sdp")
 
-    print(f"Answer from {callee_number} for {caller_number}")
+    print(f"[answer] {callee_number} for {caller_number}")
 
     call_id = call_manager.sid_to_call.get(sid)
     if not call_id:
         return
-
     call = call_manager.calls.get(call_id)
+    if not call:
+        return
     pc = call["pcs"].get(sid)
-
     if pc:
-        answer = RTCSessionDescription(sdp=sdp, type="answer")
-        await pc.setRemoteDescription(answer)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
+
+
+# ---------------------------------------------------------------------------
+# ice-candidate
+# ---------------------------------------------------------------------------
 
 @sio.on("ice-candidate")
 async def ice_candidate(sid, data):
     if sid not in call_manager.sid_to_call:
         return
-
     call_id = call_manager.sid_to_call[sid]
     call = call_manager.calls.get(call_id)
-    pc = call["pcs"].get(sid)
+    pc = call["pcs"].get(sid) if call else None
+    if not pc or not data:
+        return
 
-    if pc and data:
-        candidate_dict = data.get("candidate") if isinstance(data, dict) else data
-        if not candidate_dict: return
+    candidate_dict = data.get("candidate") if isinstance(data, dict) else data
+    if not candidate_dict:
+        return
+    cand_str = candidate_dict.get("candidate")
+    if cand_str:
+        try:
+            candidate = candidate_from_sdp(cand_str)
+            candidate.sdpMid = candidate_dict.get("sdpMid")
+            candidate.sdpMLineIndex = candidate_dict.get("sdpMLineIndex")
+            await pc.addIceCandidate(candidate)
+        except Exception as e:
+            print(f"[ice] error: {e}")
 
-        cand_str = candidate_dict.get("candidate")
-        if cand_str:
-            try:
-                # aiortc uses a helper to parse candidate strings
-                candidate = candidate_from_sdp(cand_str)
-                candidate.sdpMid = candidate_dict.get("sdpMid")
-                candidate.sdpMLineIndex = candidate_dict.get("sdpMLineIndex")
-                await pc.addIceCandidate(candidate)
-                print(f"Added ICE candidate for {sid_to_number.get(sid)}")
-            except Exception as e:
-                print(f"Error adding ICE candidate: {e}")
 
+# ---------------------------------------------------------------------------
+# accept-call  (callee accepts -> server creates callee's PC and sends offer)
+# ---------------------------------------------------------------------------
 
 @sio.on("accept-call")
 async def accept_call(sid, data):
-    # Callee accepts the call, server creates PC for callee and sends OFFER to callee
-    caller_number = str(data.get("caller"))
+    caller_number = str(data.get("caller", ""))
     callee_number = sid_to_number.get(sid)
 
-    print(f"Callee {callee_number} accepted call from {caller_number}")
+    print(f"[accept] {callee_number} accepted from {caller_number}")
 
     call_id, call = call_manager.get_or_create_call(caller_number, callee_number)
-    call_manager.sid_to_call[sid] = call_id
 
-    # Initialize Callee's PC
-    pc = RTCPeerConnection(configuration=RTCConfiguration(
-        iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-    ))
-    call["pcs"][sid] = pc
-    # Add a transceiver to receive and send audio
-    transceiver = pc.addTransceiver("audio", direction="sendrecv")
-    call["senders"][sid] = transceiver.sender
+    caller_track = call["tracks"].get(caller_number)
+    pc = await _setup_pc_for_peer(
+        sid, callee_number, caller_number, call_id, call,
+        initial_track=caller_track,
+    )
 
-    # If the caller has already shared their track, add it to this sender
-    if caller_number in call["tracks"]:
-        print(f"Adding caller's track to callee's PC initial bundle")
-        transceiver.sender.replaceTrack(call["tracks"][caller_number])
+    offer_desc = await pc.createOffer()
+    await pc.setLocalDescription(offer_desc)
 
-    @pc.on("icecandidate")
-    async def on_icecandidate(candidate):
-        if candidate:
-            await sio.emit("ice-candidate", {
-                "candidate": {
-                    "candidate": candidate.candidate,
-                    "sdpMid": candidate.sdpMid,
-                    "sdpMLineIndex": candidate.sdpMLineIndex
-                },
-                "destination": callee_number
-            }, to=sid)
-
-    @pc.on("track")
-    async def on_track(track): # Change to async
-        print(f"Received track from {callee_number} (callee)")
-        subscribed_track = relay.subscribe(track)
-        call["tracks"][callee_number] = subscribed_track
-
-        # Add track to recorder
-        if not call["recorder"]:
-            call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
-        if not call["recording_started"]:
-            await call["recorder"].start()
-            call["recording_started"] = True
-
-        # Forward callee's track to all other peers via their existing senders
-        for peer_sid, peer_sender in list(call["senders"].items()):
-            if peer_sid != sid:
-                print(f"Replacing track for peer {sid_to_number.get(peer_sid)} with callee's track")
-                await peer_sender.replaceTrack(subscribed_track)
-
-    # Create offer for callee
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-    print(f"Generated offer for {callee_number}: {pc.localDescription.sdp[:100]}...")
-
-    await sio.emit("offer", {
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type,
-        "caller": caller_number
-    }, to=sid)
+    await sio.emit(
+        "offer",
+        {
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type,
+            "caller": caller_number,
+        },
+        to=sid,
+    )
 
     if caller_number in users:
         await sio.emit("call-accepted", {"callee": callee_number}, to=users[caller_number])
+
+
+# ---------------------------------------------------------------------------
+# end-call
+# ---------------------------------------------------------------------------
 
 @sio.on("end-call")
 async def end_call(sid, data):
@@ -306,41 +323,12 @@ async def end_call(sid, data):
     target_number = str(data.get("destination", ""))
     call_id = call_manager.sid_to_call.get(sid)
     if call_id:
-        await call_manager.close_call(call_id)  # closes PCs, cleans sid_to_call
+        await call_manager.close_call(call_id)
     if target_number in users:
         await sio.emit("end-call", {"caller": caller_number}, to=users[target_number])
 
-# 2. Guard renegotiate with a small delay + state check:
-async def renegotiate(sid, pc):
-    await asyncio.sleep(0.1)  # let ICE settle
-    if pc.signalingState == "stable":
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        await sio.emit("offer", {
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type,
-            "destination": sid_to_number.get(sid)
-        }, to=sid)
 
-async def upload_recording(request):
-    reader = await request.multipart()
-    field = await reader.next()
-    if field.name == 'file':
-        filename = field.filename
-        filepath = f"recordings/{filename}"
-        size = 0
-        with open(filepath, 'wb') as f:
-            while True:
-                chunk = await field.read_chunk()
-                if not chunk:
-                    break
-                size += len(chunk)
-                f.write(chunk)
-        print(f"Saved recording: {filepath} ({size} bytes)")
-        return web.json_response({'status': 'ok', 'filename': filename})
-    return web.json_response({'error': 'No file found'})
-
-app.router.add_post('/upload-recording', upload_recording)
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
