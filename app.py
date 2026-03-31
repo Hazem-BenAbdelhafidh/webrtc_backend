@@ -1,12 +1,10 @@
-import logging
-import json
 import os
 import asyncio
 from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
-from aiortc.contrib.media import MediaRelay, MediaRecorder
+from aiortc.contrib.media import MediaRelay  # , MediaRecorder
 
 relay = MediaRelay()
 
@@ -36,12 +34,12 @@ class CallManager:
             call = self.calls.pop(call_id)
 
             # Stop recorder if active
-            if call["recorder"]:
-                try:
-                    await call["recorder"].stop()
-                    print(f"Recording for {call_id} saved.")
-                except Exception as e:
-                    print(f"Error stopping recorder: {e}")
+            # if call["recorder"]:
+            #     try:
+            #         await call["recorder"].stop()
+            #         print(f"Recording for {call_id} saved.")
+            #     except Exception as e:
+            #         print(f"Error stopping recorder: {e}")
 
             for sid, pc in list(call["pcs"].items()):
                 await pc.close()
@@ -140,14 +138,6 @@ async def offer(sid, data):
         subscribed_track = relay.subscribe(track)
         call["tracks"][caller_number] = subscribed_track
 
-        # Add track to recorder
-        if not call["recorder"]:
-            call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
-        if not call["recording_started"]:
-            await call["recorder"].start()
-            call["recording_started"] = True
-
         # Forward caller's track to all other peers via their existing senders
         for peer_sid, peer_sender in list(call["senders"].items()):
             if peer_sid != sid:
@@ -166,8 +156,9 @@ async def offer(sid, data):
     print(f"Generated answer for {caller_number}: {pc.localDescription.sdp[:100]}...")
 
     # Return answer to caller
+    optimized_sdp = optimize_sdp(pc.localDescription.sdp)
     await sio.emit("answer", {
-        "sdp": pc.localDescription.sdp,
+        "sdp": optimized_sdp,
         "type": pc.localDescription.type,
         "destination": caller_number
     }, to=sid)
@@ -272,14 +263,6 @@ async def accept_call(sid, data):
         subscribed_track = relay.subscribe(track)
         call["tracks"][callee_number] = subscribed_track
 
-        # Add track to recorder
-        if not call["recorder"]:
-            call["recorder"] = MediaRecorder(f"recordings/call_{call_id}.wav")
-        call["recorder"].addTrack(relay.subscribe(track))
-        if not call["recording_started"]:
-            await call["recorder"].start()
-            call["recording_started"] = True
-
         # Forward callee's track to all other peers via their existing senders
         for peer_sid, peer_sender in list(call["senders"].items()):
             if peer_sid != sid:
@@ -289,16 +272,51 @@ async def accept_call(sid, data):
     # Create offer for callee
     offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
-    print(f"Generated offer for {callee_number}: {pc.localDescription.sdp[:100]}...")
+    optimized_sdp = optimize_sdp(pc.localDescription.sdp)
+    print(f"Generated optimized offer for {callee_number}")
 
     await sio.emit("offer", {
-        "sdp": pc.localDescription.sdp,
+        "sdp": optimized_sdp,
         "type": pc.localDescription.type,
         "caller": caller_number
     }, to=sid)
 
     if caller_number in users:
         await sio.emit("call-accepted", {"callee": callee_number}, to=users[caller_number])
+
+def optimize_sdp(sdp):
+    """
+    Mangle SDP to force Opus ptime=10 for lower latency.
+    """
+    print("Mangling backend SDP for low latency (ptime=10)...")
+
+    # 1. Force ptime:10
+    if "a=ptime:" in sdp:
+        import re
+        sdp = re.sub(r"a=ptime:\d+", "a=ptime:10", sdp)
+    else:
+        sdp = sdp.replace("a=rtcp-mux", "a=rtcp-mux\r\na=ptime:10")
+
+    # 2. Update fmtp parameters for Opus
+    # Typically Opus uses payload type 111. aiortc might vary, so we target fmtp lines with opus features.
+    import re
+    def replace_fmtp(match):
+        pt = match.group(1)
+        params = match.group(2)
+        if "minptime" in params or "useinbandfec" in params or "stereo" in params:
+            if "minptime=" not in params: params += ";minptime=10"
+            else: params = re.sub(r"minptime=\d+", "minptime=10", params)
+
+            if "ptime=" not in params: params += ";ptime=10"
+            else: params = re.sub(r"ptime=\d+", "ptime=10", params)
+
+            if "useinbandfec=" not in params: params += ";useinbandfec=1"
+            if "stereo=" not in params: params += ";stereo=0;sprop-stereo=0"
+            return f"a=fmtp:{pt}{params}"
+        return match.group(0)
+
+    sdp = re.sub(r"a=fmtp:(\d+)(.*)", replace_fmtp, sdp)
+    return sdp
 
 @sio.on("end-call")
 async def end_call(sid, data):
