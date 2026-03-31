@@ -4,9 +4,6 @@ from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
-from aiortc.contrib.media import MediaRelay  # , MediaRecorder
-
-relay = MediaRelay()
 
 class CallManager:
     def __init__(self):
@@ -135,14 +132,13 @@ async def offer(sid, data):
     @pc.on("track")
     async def on_track(track): # Change to async
         print(f"Received track from {caller_number}")
-        subscribed_track = relay.subscribe(track)
-        call["tracks"][caller_number] = subscribed_track
+        call["tracks"][caller_number] = track
 
         # Forward caller's track to all other peers via their existing senders
         for peer_sid, peer_sender in list(call["senders"].items()):
             if peer_sid != sid:
                 print(f"Replacing track for peer {sid_to_number.get(peer_sid)} with caller's track")
-                await peer_sender.replaceTrack(subscribed_track)
+                peer_sender.replaceTrack(track)
                 # No offer/answer needed for replaceTrack in aiortc usually,
                 # but if the client hasn't connected yet, the initial offer will handle it.
 
@@ -156,7 +152,7 @@ async def offer(sid, data):
     print(f"Generated answer for {caller_number}: {pc.localDescription.sdp[:100]}...")
 
     # Return answer to caller
-    optimized_sdp = optimize_sdp(pc.localDescription.sdp)
+    optimized_sdp = pc.localDescription.sdp
     await sio.emit("answer", {
         "sdp": optimized_sdp,
         "type": pc.localDescription.type,
@@ -260,14 +256,13 @@ async def accept_call(sid, data):
     @pc.on("track")
     async def on_track(track): # Change to async
         print(f"Received track from {callee_number} (callee)")
-        subscribed_track = relay.subscribe(track)
-        call["tracks"][callee_number] = subscribed_track
+        call["tracks"][callee_number] = track
 
         # Forward callee's track to all other peers via their existing senders
         for peer_sid, peer_sender in list(call["senders"].items()):
             if peer_sid != sid:
                 print(f"Replacing track for peer {sid_to_number.get(peer_sid)} with callee's track")
-                await peer_sender.replaceTrack(subscribed_track)
+                peer_sender.replaceTrack(track)
 
     # Create offer for callee
     offer = await pc.createOffer()
@@ -286,24 +281,28 @@ async def accept_call(sid, data):
 
 def optimize_sdp(sdp):
     """
-    Mangle SDP to force Opus ptime=10 for lower latency.
+    Mangle SDP to force Opus with absolute minimum latency settings.
     """
-    print("Mangling backend SDP for low latency (ptime=10)...")
+    print("Mangling backend SDP for lowest latency...")
+    import re
 
     # 1. Force ptime:10
     if "a=ptime:" in sdp:
-        import re
         sdp = re.sub(r"a=ptime:\d+", "a=ptime:10", sdp)
     else:
         sdp = sdp.replace("a=rtcp-mux", "a=rtcp-mux\r\na=ptime:10")
 
-    # 2. Update fmtp parameters for Opus
-    # Typically Opus uses payload type 111. aiortc might vary, so we target fmtp lines with opus features.
-    import re
+    # Isolate Opus Payload Type
+    opus_pt = "111"
+    rtpmap_match = re.search(r"a=rtpmap:(\d+)\s+opus/48000", sdp, re.IGNORECASE)
+    if rtpmap_match:
+        opus_pt = rtpmap_match.group(1)
+
+    # Modify or add Opus fmtp parameters for maximum delay reduction
     def replace_fmtp(match):
         pt = match.group(1)
         params = match.group(2)
-        if "minptime" in params or "useinbandfec" in params or "stereo" in params:
+        if pt == opus_pt:
             if "minptime=" not in params: params += ";minptime=10"
             else: params = re.sub(r"minptime=\d+", "minptime=10", params)
 
@@ -312,10 +311,25 @@ def optimize_sdp(sdp):
 
             if "useinbandfec=" not in params: params += ";useinbandfec=1"
             if "stereo=" not in params: params += ";stereo=0;sprop-stereo=0"
+
+            # Use 32kbps Constant Bit Rate (CBR) to avoid encoder complexity & network jitter
+            if "maxaveragebitrate=" not in params: params += ";maxaveragebitrate=32000"
+            else: params = re.sub(r"maxaveragebitrate=\d+", "maxaveragebitrate=32000", params)
+
+            if "cbr=" not in params: params += ";cbr=1"
+
             return f"a=fmtp:{pt}{params}"
         return match.group(0)
 
-    sdp = re.sub(r"a=fmtp:(\d+)(.*)", replace_fmtp, sdp)
+    fmtp_pattern = f"a=fmtp:{opus_pt}(.*)"
+    if re.search(fmtp_pattern, sdp):
+        sdp = re.sub(r"a=fmtp:(\d+)(.*)", replace_fmtp, sdp)
+    else:
+        # If no fmtp line exists for Opus, add one below its rtpmap
+        rtpmap_line = rtpmap_match.group(0) if rtpmap_match else f"a=rtpmap:{opus_pt} opus/48000/2"
+        optimized_fmtp = f"a=fmtp:{opus_pt} minptime=10;ptime=10;useinbandfec=1;stereo=0;sprop-stereo=0;maxaveragebitrate=32000;cbr=1"
+        sdp = sdp.replace(rtpmap_line, f"{rtpmap_line}\r\n{optimized_fmtp}")
+
     return sdp
 
 @sio.on("end-call")
