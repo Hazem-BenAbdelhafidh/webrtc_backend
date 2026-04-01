@@ -15,6 +15,8 @@ from manager import call_manager
 # Configure manager with the global provider
 call_manager.provider = provider
 
+print("TWILIO_ACCOUNT_SID:", os.environ.get("TWILIO_ACCOUNT_SID"))
+
 sio = socketio.AsyncServer(
     async_mode='aiohttp',
     cors_allowed_origins='*',
