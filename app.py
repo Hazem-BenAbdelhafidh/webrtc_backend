@@ -6,6 +6,7 @@ from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
+from dotenv import load_dotenv
 load_dotenv()
 
 from providers.handlers import twilio_token_handler, twilio_voice_handler, home_handler, provider
