@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from providers.factory import get_provider
 
 # Load environment variables
+load_dotenv()
 
 from providers.factory import get_provider
 from manager import call_manager
@@ -46,17 +47,17 @@ async def twilio_voice_handler(request):
     This also handles the callback logic for outbound conference invitations.
     """
     print("[Voice] Webhook triggered")
-
+    
     # APP_BASE_URL is required to build the callback URL for outbound calls
     app_base_url = os.getenv("APP_BASE_URL", "").rstrip('/')
-
+    
     # Get parameters from POST form data or Query string
     try:
         params = await request.post()
     except Exception:
         params = {}
     query = request.query
-
+    
     # 'To' might be a phone number or a room name
     to_number = (
         params.get("To")
@@ -72,7 +73,7 @@ async def twilio_voice_handler(request):
 
     # Check if we are being called back (outbound leg)
     room_name = query.get("room")
-
+    
     if room_name:
         # This is an outbound call callback, just join the room
         print(f"[Voice] Joining room '{room_name}' (outbound leg callback)")
@@ -87,23 +88,23 @@ async def twilio_voice_handler(request):
     if is_phone_number(to_number):
         # Generate a room name (we can use the phone number itself, or a hash)
         # Using the phone number as the room name for simplicity.
-        room_name = re.sub(r'[^a-zA-Z0-9]', '', to_number)
-
+        room_name = re.sub(r'[^a-zA-Z0-9]', '', to_number) 
+        
         callback_url = f"{app_base_url}/voice"
         if not app_base_url:
             print("[Warning] APP_BASE_URL not set! Outbound calls will fail.")
-
+        
         # Get the caller's number to track the leg
         from_number = params.get("From") or query.get("From") or "unknown"
-
+        
         try:
             # Invite the phone number to the room
             leg_id = provider.initiate_outbound_call(to_number, room_name, should_record, callback_url)
-
+            
             # Track this leg in the manager
             if leg_id:
                 call_manager.add_leg_id(from_number, to_number, leg_id)
-
+            
             # Put the original caller (WebRTC) into the same room
             response_content = provider.generate_voice_response(room_name, should_record, app_base_url)
             return web.Response(text=response_content, content_type=provider.content_type)
