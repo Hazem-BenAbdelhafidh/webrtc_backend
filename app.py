@@ -1,49 +1,18 @@
 import os
 import asyncio
+import json
+import base64
 from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
+from dotenv import load_dotenv
 
-class CallManager:
-    def __init__(self):
-        self.calls = {} # type: dict
-        self.sid_to_call = {} # type: dict
+from providers.handlers import twilio_token_handler, twilio_voice_handler, home_handler, provider
+from manager import call_manager
 
-    def get_or_create_call(self, caller_num: str, callee_num: str):
-        # Ensure consistent call_id regardless of who calls whom
-        nums = sorted([caller_num, callee_num])
-        call_id = f"{nums[0]}-{nums[1]}"
-        if call_id not in self.calls:
-            self.calls[call_id] = {
-                "caller_num": caller_num,
-                "callee_num": callee_num,
-                "pcs": {}, # sid -> pc
-                "senders": {}, # sid -> sender
-                "tracks": {}, # number -> track
-                "recorder": None,
-                "recording_started": False
-            }
-        return call_id, self.calls[call_id]
-
-    async def close_call(self, call_id: str):
-        if call_id in self.calls:
-            call = self.calls.pop(call_id)
-
-            # Stop recorder if active
-            # if call["recorder"]:
-            #     try:
-            #         await call["recorder"].stop()
-            #         print(f"Recording for {call_id} saved.")
-            #     except Exception as e:
-            #         print(f"Error stopping recorder: {e}")
-
-            for sid, pc in list(call["pcs"].items()):
-                await pc.close()
-                self.sid_to_call.pop(sid, None)
-            print(f"Call {call_id} closed.")
-
-call_manager = CallManager()
+# Configure manager with the global provider
+call_manager.provider = provider
 
 sio = socketio.AsyncServer(
     async_mode='aiohttp',
@@ -372,7 +341,59 @@ async def upload_recording(request):
         return web.json_response({'status': 'ok', 'filename': filename})
     return web.json_response({'error': 'No file found'})
 
+async def log_metrics(request):
+    try:
+        data = await request.json()
+        # Extract useful metrics for easy reading
+        rtt = data.get('rtt', 'N/A')
+        jitter = data.get('jitter', 'N/A')
+        loss = data.get('loss', 0)
+        mos = data.get('mos', 'N/A')
+        print(f"[Metrics] RTT: {rtt}ms | Jitter: {jitter}ms | Loss: {loss} | MOS: {mos}")
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=400)
+
+async def stream_handler(request):
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    print(f"[Stream] WebSocket connection established")
+
+    call_sid = None
+
+    async for msg in ws:
+        if msg.type == web.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data)
+                event = data.get("event")
+
+                if event == "start":
+                    call_sid = data.get('start', {}).get('callSid') or data.get('start', {}).get('streamSid')
+                    print(f"[Stream] Audio stream started for Call SID: {call_sid}")
+                elif event == "media":
+                    # Here is where the raw audio bytes are (in base64)
+                    payload = data.get('media', {}).get('payload')
+                    chunk = base64.b64decode(payload)
+                    print("audio chunk hazem : ", chunk)
+                    # [TRANSCRIPTION LOGIC GOES HERE]
+                    pass
+                elif event == "stop":
+                    print(f"[Stream] Audio stream stopped for Call SID: {call_sid}")
+            except Exception as e:
+                print(f"[Stream] Error parsing message: {e}")
+        elif msg.type == web.WSMsgType.ERROR:
+            print(f"[Stream] WebSocket connection closed with error {ws.exception()}")
+
+    print(f"[Stream] WebSocket connection closed")
+    return ws
+
+# Register Routes
+app.router.add_get('/', home_handler)
+app.router.add_get('/token', twilio_token_handler)
+app.router.add_post('/voice', twilio_voice_handler)
 app.router.add_post('/upload-recording', upload_recording)
+app.router.add_post('/log-metrics', log_metrics)
+app.router.add_get('/stream', stream_handler)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

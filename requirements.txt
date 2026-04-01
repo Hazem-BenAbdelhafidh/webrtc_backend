@@ -3,4 +3,12 @@ aiohttp==3.9.5
 aiortc>=1.9.0
 av>=12.1.0
 python-engineio>=4.9.1
+flask
+flask-cors
+python-dotenv
+twilio
+telnyx==4.90.0
+httpx
+
+
 
