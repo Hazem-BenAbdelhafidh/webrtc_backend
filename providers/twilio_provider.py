@@ -14,6 +14,19 @@ class TwilioProvider(BaseCallingProvider):
         self._caller_id = os.getenv("TWILIO_PHONE_NUMBER")
         self.push_credential_sid = os.getenv("TWILIO_PUSH_CREDENTIAL_SID")
 
+        # Validate required Twilio credentials
+        missing_vars = []
+        if not self.account_sid: missing_vars.append("TWILIO_ACCOUNT_SID")
+        if not self.api_key: missing_vars.append("TWILIO_API_KEY")
+        if not self.api_secret: missing_vars.append("TWILIO_API_SECRET")
+        if not self.twiml_app_sid: missing_vars.append("TWILIO_TWIML_APP_SID")
+        if not self._caller_id: missing_vars.append("TWILIO_PHONE_NUMBER")
+
+        if missing_vars:
+            err_msg = f"Missing Twilio configuration environment variables: {', '.join(missing_vars)}"
+            print(f"[Twilio] {err_msg}")
+            raise ValueError(err_msg)
+
         # Twilio Client for REST API
         self.client = Client(self.api_key, self.api_secret, self.account_sid)
 

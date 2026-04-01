@@ -8,6 +8,17 @@ class TelnyxProvider(BaseCallingProvider):
         self.connection_id = os.getenv("TELNYX_CONNECTION_ID")
         self._caller_id = os.getenv("TELNYX_NUMBER")
 
+        # Validate required Telnyx credentials
+        missing_vars = []
+        if not self.api_key: missing_vars.append("TELNYX_API_KEY")
+        if not self.connection_id: missing_vars.append("TELNYX_CONNECTION_ID")
+        if not self._caller_id: missing_vars.append("TELNYX_NUMBER")
+
+        if missing_vars:
+            err_msg = f"Missing Telnyx configuration environment variables: {', '.join(missing_vars)}"
+            print(f"[Telnyx] {err_msg}")
+            raise ValueError(err_msg)
+
         self.client = None
         if self.api_key:
             self.client = telnyx.Telnyx(api_key=self.api_key)
