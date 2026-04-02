@@ -39,22 +39,22 @@ async def disconnect(sid):
     print(f"Client disconnected: {sid}")
     if sid in call_manager.sid_to_call:
         call_id = call_manager.sid_to_call[sid]
-        
+
         # Check remaining participants before closing
         if call_id in call_manager.calls:
             call = call_manager.calls[call_id]
             remaining_pstn = len(call.get("provider_leg_ids", []))
             remaining_webrtc = len(call.get("pcs", {})) - 1  # -1 for current disconnecting client
             total_remaining = remaining_pstn + remaining_webrtc
-            
+
             print(f"[WebRTC Disconnect] Room '{call_id}': {remaining_pstn} PSTN, {remaining_webrtc} WebRTC remaining")
-            
+
             if total_remaining < 2:
                 print(f"[WebRTC Disconnect] Only {total_remaining} participant(s) left — closing room '{call_id}'")
                 await call_manager.close_call(call_id)
                 await broadcast_active_calls()
                 return
-        
+
         await call_manager.close_call(call_id)
         await broadcast_active_calls()
 
@@ -452,6 +452,12 @@ async def stream_handler(request):
     print(f"[Stream] WebSocket connection established")
 
     call_sid = None
+    provider = None
+
+    # Check if this is a Telnyx stream (check query params or headers)
+    if request.query.get('provider') == 'telnyx':
+        provider = 'telnyx'
+    print(f"[Stream] Provider: {provider or 'twilio'}")
 
     async for msg in ws:
         if msg.type == web.WSMsgType.TEXT:
@@ -463,12 +469,10 @@ async def stream_handler(request):
                     call_sid = data.get('start', {}).get('callSid') or data.get('start', {}).get('streamSid')
                     print(f"[Stream] Audio stream started for Call SID: {call_sid}")
                 elif event == "media":
-                    # Here is where the raw audio bytes are (in base64)
                     payload = data.get('media', {}).get('payload')
                     if payload:
                         chunk = base64.b64decode(payload)
-                        print("audio chunk hazem", chunk)
-                        # TODO: pipe chunk to transcription service
+                        print(f"[Stream] Audio chunk ({provider or 'twilio'}): {len(chunk)} bytes")
                     pass
                 elif event == "stop":
                     print(f"[Stream] Audio stream stopped for Call SID: {call_sid}")
