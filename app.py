@@ -18,7 +18,20 @@ sio = socketio.AsyncServer(
     cors_allowed_origins='*',
     max_http_buffer_size=10000000 # 10MB
 )
-app = web.Application()
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        response = await handler(request)
+
+    # Add CORS headers
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, DELETE"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-requested-with"
+    return response
+
+app = web.Application(middlewares=[cors_middleware])
 
 # Expose sio for use in handlers
 import providers.handlers as handlers_module
