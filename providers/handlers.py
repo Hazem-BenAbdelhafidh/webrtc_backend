@@ -154,7 +154,14 @@ async def twilio_voice_handler(request):
             # Register the call room in manager
             call_manager.get_or_create_call(room_name)
             
-            # Invite the phone number to the room
+            # Track the ORIGINAL caller (WebRTC participant) - this is the client making the call
+            # We use a special prefix to distinguish from PSTN legs
+            caller_marker = f"webrtc:{from_number}"
+            if caller_marker not in call_manager.calls[room_name]["provider_leg_ids"]:
+                call_manager.calls[room_name]["provider_leg_ids"].append(caller_marker)
+                print(f"[Voice] Tracked WebRTC caller {caller_marker} in room {room_name}")
+            
+            # Invite the phone number to the room (outbound PSTN leg)
             leg_id = provider.initiate_outbound_call(to_number, room_name, should_record, callback_url)
 
             # Track this PSTN leg in the room
@@ -287,19 +294,18 @@ async def telnyx_webhook_handler(request):
 
         if room_name:
             # Check if room should be closed (no PSTN legs and no WebRTC participants)
-            remaining_pstn = len(call_manager.calls.get(room_name, {}).get("provider_leg_ids", []))
-            remaining_webrtc = len(call_manager.calls.get(room_name, {}).get("pcs", {}))
-            total_remaining = remaining_pstn + remaining_webrtc
+            leg_ids = call_manager.calls.get(room_name, {}).get("provider_leg_ids", [])
+            # Count only actual PSTN legs (not webrtc: markers)
+            remaining_pstn = len([lid for lid in leg_ids if not lid.startswith("webrtc:")])
+            remaining_webrtc_markers = len([lid for lid in leg_ids if lid.startswith("webrtc:")])
+            remaining_pcs = len(call_manager.calls.get(room_name, {}).get("pcs", {}))
+            total_remaining = remaining_pstn + remaining_webrtc_markers + remaining_pcs
 
-            print(f"[Telnyx] Room '{room_name}': {remaining_pstn} PSTN legs, {remaining_webrtc} WebRTC participants")
+            print(f"[Telnyx] Room '{room_name}': {remaining_pstn} PSTN legs, {remaining_webrtc_markers} WebRTC markers, {remaining_pcs} PCs")
 
             if total_remaining < 2:
                 print(f"[Telnyx] Only {total_remaining} participant(s) left in room '{room_name}' — closing")
                 asyncio.create_task(call_manager.close_call(room_name))
-
-                # Try to end the Telnyx conference via TeXML (conference ends when last participant exits)
-                # For TeXML conferences, the conference ends when the last participant leaves
-                # We just need to clean up our local state which we just did
 
         # Also broadcast updated active calls to connected clients
         asyncio.create_task(broadcast_active_calls())

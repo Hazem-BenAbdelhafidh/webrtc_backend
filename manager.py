@@ -55,9 +55,11 @@ class CallManager:
                 except Exception: pass
                 self.sid_to_call.pop(sid, None)
             
-            # 2. Terminate PSTN legs via provider
+            # 2. Terminate PSTN legs via provider (skip webrtc: prefixed entries)
             if self.provider:
                 for leg_id in call["provider_leg_ids"]:
+                    if leg_id.startswith("webrtc:"):
+                        continue  # Skip WebRTC markers, they're not real PSTN legs
                     try:
                         self.provider.terminate_call(leg_id)
                     except Exception as e:

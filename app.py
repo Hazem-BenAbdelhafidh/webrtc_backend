@@ -379,6 +379,73 @@ async def log_metrics(request):
     except Exception as e:
         return web.json_response({"error": str(e)}, status=400)
 
+async def register_participant(request):
+    """
+    Registers a WebRTC participant as joining a conference room.
+    Used by Telnyx clients since their WebRTC connection is direct to Telnyx,
+    not through the backend's Socket.IO.
+    """
+    try:
+        data = await request.json()
+        room_name = data.get('room_name')
+        participant_id = data.get('participant_id')  # phone number or identity
+
+        if not room_name or not participant_id:
+            return web.json_response({"error": "room_name and participant_id required"}, status=400)
+
+        print(f"[Register Participant] {participant_id} joining room {room_name}")
+
+        # Create/get the room
+        call_manager.get_or_create_call(room_name)
+
+        # Track this participant
+        if room_name in call_manager.calls:
+            # Add a marker that this is a WebRTC participant (not PSTN)
+            webrtc_key = f"webrtc:{participant_id}"
+            if webrtc_key not in call_manager.calls[room_name]["provider_leg_ids"]:
+                call_manager.calls[room_name]["provider_leg_ids"].append(webrtc_key)
+                print(f"[Register Participant] Added {webrtc_key} to room {room_name}")
+
+        return web.json_response({
+            "status": "ok",
+            "room_name": room_name,
+            "participant_id": participant_id
+        })
+    except Exception as e:
+        print(f"[Register Participant] Error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def unregister_participant(request):
+    """
+    Unregisters a WebRTC participant from a conference room.
+    """
+    try:
+        data = await request.json()
+        room_name = data.get('room_name')
+        participant_id = data.get('participant_id')
+
+        if not room_name or not participant_id:
+            return web.json_response({"error": "room_name and participant_id required"}, status=400)
+
+        print(f"[Unregister Participant] {participant_id} leaving room {room_name}")
+
+        if room_name in call_manager.calls:
+            webrtc_key = f"webrtc:{participant_id}"
+            if webrtc_key in call_manager.calls[room_name]["provider_leg_ids"]:
+                call_manager.calls[room_name]["provider_leg_ids"].remove(webrtc_key)
+                print(f"[Unregister Participant] Removed {webrtc_key} from room {room_name}")
+
+            # Check if room should be closed
+            remaining = len(call_manager.calls[room_name]["provider_leg_ids"]) + len(call_manager.calls[room_name]["pcs"])
+            if remaining < 2:
+                print(f"[Unregister Participant] Only {remaining} participant(s) left, closing room")
+                await call_manager.close_call(room_name)
+
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        print(f"[Unregister Participant] Error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 async def stream_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -413,6 +480,35 @@ async def stream_handler(request):
     print(f"[Stream] WebSocket connection closed")
     return ws
 
+async def register_participant(request):
+    """
+    Registers a participant as joining a conference room.
+    Used by Telnyx WebRTC clients since their calls don't trigger /voice webhooks.
+    """
+    try:
+        data = await request.json()
+        room_name = data.get('room_name')
+        participant_id = data.get('participant_id', 'unknown')
+
+        if not room_name:
+            return web.json_response({"error": "room_name required"}, status=400)
+
+        # Create/get the room
+        call_manager.get_or_create_call(room_name)
+
+        # Add participant marker
+        marker = f"webrtc:{participant_id}"
+        if room_name in call_manager.calls:
+            if marker not in call_manager.calls[room_name]["provider_leg_ids"]:
+                call_manager.calls[room_name]["provider_leg_ids"].append(marker)
+                print(f"[Register] Added {marker} to room {room_name}")
+            await broadcast_active_calls()
+
+        return web.json_response({"status": "ok"})
+    except Exception as e:
+        print(f"[Register] Error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
 # Register Routes
 app.router.add_get('/', home_handler)
 app.router.add_get('/web', web_dashboard_handler)
@@ -422,6 +518,7 @@ app.router.add_post('/voice', twilio_voice_handler)
 app.router.add_get('/voice', twilio_voice_handler)  # Telnyx TeXML may use GET
 app.router.add_post('/voice/status', twilio_status_handler)
 app.router.add_post('/telnyx/webhook', telnyx_webhook_handler)
+app.router.add_post('/register-call', register_participant)
 app.router.add_post('/upload-recording', upload_recording)
 app.router.add_post('/log-metrics', log_metrics)
 app.router.add_get('/stream', stream_handler)
