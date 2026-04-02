@@ -2,36 +2,51 @@ import asyncio
 
 class CallManager:
     def __init__(self):
-        self.calls = {} # type: dict
-        self.sid_to_call = {} # type: dict
+        self.calls = {} # room_name -> call_data
+        self.sid_to_call = {} # sid -> room_name
         self.provider = None # Set by app.py
 
-    def get_or_create_call(self, caller_num: str, callee_num: str):
-        # Ensure consistent call_id regardless of who calls whom
-        nums = sorted([caller_num, callee_num])
-        call_id = f"{nums[0]}-{nums[1]}"
-        if call_id not in self.calls:
-            self.calls[call_id] = {
-                "caller_num": caller_num,
-                "callee_num": callee_num,
+    def get_or_create_call(self, room_name: str, participants_info: dict = None):
+        """
+        Retrieves or creates a conference call session by room name.
+        """
+        if room_name not in self.calls:
+            print(f"[Manager] Creating new room: {room_name}")
+            self.calls[room_name] = {
+                "room_name": room_name,
                 "pcs": {}, # sid -> pc
                 "senders": {}, # sid -> sender
-                "tracks": {}, # number -> track
-                "provider_leg_ids": [], # List of SIDs to hang up
+                "tracks": {}, # participant_identity -> track
+                "provider_leg_ids": [], # List of SIDs (from PSTN) to hang up
                 "recorder": None,
-                "recording_started": False
+                "recording_started": False,
+                "start_time": asyncio.get_event_loop().time()
             }
-        return call_id, self.calls[call_id]
+        
+        return room_name, self.calls[room_name]
 
-    def add_leg_id(self, caller_num: str, callee_num: str, leg_id: str):
-        _, call = self.get_or_create_call(caller_num, callee_num)
-        if leg_id not in call["provider_leg_ids"]:
-            call["provider_leg_ids"].append(leg_id)
-            print(f"[Manager] Added leg ID {leg_id} to call between {caller_num} and {callee_num}")
+    def add_leg_id(self, room_name: str, leg_id: str):
+        """Adds a PSTN leg ID to a specific room."""
+        if room_name in self.calls:
+            if leg_id not in self.calls[room_name]["provider_leg_ids"]:
+                self.calls[room_name]["provider_leg_ids"].append(leg_id)
+                print(f"[Manager] Added leg ID {leg_id} to room {room_name}")
 
-    async def close_call(self, call_id: str):
-        if call_id in self.calls:
-            call = self.calls.pop(call_id)
+    def get_active_calls(self):
+        """Returns a list of all active rooms with their participant count."""
+        active = []
+        for room_name, data in self.calls.items():
+            active.append({
+                "room_name": room_name,
+                "participant_count": len(data["pcs"]) + len(data["provider_leg_ids"]),
+                "duration": int(asyncio.get_event_loop().time() - data["start_time"])
+            })
+        return active
+
+    async def close_call(self, room_name: str):
+        """Terminates all legs and closes all PCs in a room."""
+        if room_name in self.calls:
+            call = self.calls.pop(room_name)
 
             # 1. Close WebRTC PeerConnections
             for sid, pc in list(call["pcs"].items()):
@@ -48,6 +63,6 @@ class CallManager:
                     except Exception as e:
                         print(f"[Manager] Error terminating leg {leg_id}: {e}")
 
-            print(f"Call {call_id} closed (all legs terminated).")
+            print(f"Room {room_name} closed (all participants removed).")
 
 call_manager = CallManager()

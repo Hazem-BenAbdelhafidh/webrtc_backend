@@ -64,14 +64,18 @@ class TwilioProvider(BaseCallingProvider):
 
         dial = voice_response.dial()
         # Conference name is the room_name.
+        status_url = f"{app_base_url}/voice/status" if app_base_url else ""
+        
         dial.conference(
             room_name,
             start_conference_on_enter=True,
-            end_conference_on_exit=True,
+            end_conference_on_exit=False,
             beep="false",
             wait_url="",
             jitter_buffer_delay="0",
-            record="record-from-start" if should_record else "do-not-record"
+            record="record-from-start" if should_record else "do-not-record",
+            status_callback=status_url,
+            status_callback_event="start end join leave"
         )
 
         return str(voice_response)

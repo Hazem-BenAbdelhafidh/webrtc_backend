@@ -6,9 +6,8 @@ from aiohttp import web
 import socketio
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.sdp import candidate_from_sdp
-from dotenv import load_dotenv
 
-from providers.handlers import twilio_token_handler, twilio_voice_handler, home_handler, provider
+from providers.handlers import twilio_token_handler, twilio_voice_handler, home_handler, provider, active_calls_handler, twilio_status_handler, web_dashboard_handler, telnyx_webhook_handler, broadcast_active_calls
 from manager import call_manager
 
 # Configure manager with the global provider
@@ -20,6 +19,10 @@ sio = socketio.AsyncServer(
     max_http_buffer_size=10000000 # 10MB
 )
 app = web.Application()
+
+# Expose sio for use in handlers
+import providers.handlers as handlers_module
+handlers_module.sio = sio
 sio.attach(app)
 
 # Mapping from phone number -> sid
@@ -36,7 +39,24 @@ async def disconnect(sid):
     print(f"Client disconnected: {sid}")
     if sid in call_manager.sid_to_call:
         call_id = call_manager.sid_to_call[sid]
+        
+        # Check remaining participants before closing
+        if call_id in call_manager.calls:
+            call = call_manager.calls[call_id]
+            remaining_pstn = len(call.get("provider_leg_ids", []))
+            remaining_webrtc = len(call.get("pcs", {})) - 1  # -1 for current disconnecting client
+            total_remaining = remaining_pstn + remaining_webrtc
+            
+            print(f"[WebRTC Disconnect] Room '{call_id}': {remaining_pstn} PSTN, {remaining_webrtc} WebRTC remaining")
+            
+            if total_remaining < 2:
+                print(f"[WebRTC Disconnect] Only {total_remaining} participant(s) left — closing room '{call_id}'")
+                await call_manager.close_call(call_id)
+                await broadcast_active_calls()
+                return
+        
         await call_manager.close_call(call_id)
+        await broadcast_active_calls()
 
     if sid in sid_to_number:
         number = sid_to_number.pop(sid)
@@ -75,6 +95,10 @@ async def offer(sid, data):
         iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
     ))
     call["pcs"][sid] = pc
+
+    # Notify other clients about the updated participant count
+    await sio.emit("active_calls_updated", call_manager.get_active_calls())
+
     # Add a transceiver to receive and send audio
     transceiver = pc.addTransceiver("audio", direction="sendrecv")
     call["senders"][sid] = transceiver.sender
@@ -308,6 +332,7 @@ async def end_call(sid, data):
     call_id = call_manager.sid_to_call.get(sid)
     if call_id:
         await call_manager.close_call(call_id)  # closes PCs, cleans sid_to_call
+        await broadcast_active_calls()
     if target_number in users:
         await sio.emit("end-call", {"caller": caller_number}, to=users[target_number])
 
@@ -373,9 +398,10 @@ async def stream_handler(request):
                 elif event == "media":
                     # Here is where the raw audio bytes are (in base64)
                     payload = data.get('media', {}).get('payload')
-                    chunk = base64.b64decode(payload)
-                    print("audio chunk hazem : ", chunk)
-                    # [TRANSCRIPTION LOGIC GOES HERE]
+                    if payload:
+                        chunk = base64.b64decode(payload)
+                        print("audio chunk hazem", chunk)
+                        # TODO: pipe chunk to transcription service
                     pass
                 elif event == "stop":
                     print(f"[Stream] Audio stream stopped for Call SID: {call_sid}")
@@ -389,8 +415,13 @@ async def stream_handler(request):
 
 # Register Routes
 app.router.add_get('/', home_handler)
+app.router.add_get('/web', web_dashboard_handler)
 app.router.add_get('/token', twilio_token_handler)
+app.router.add_get('/active-calls', active_calls_handler)
 app.router.add_post('/voice', twilio_voice_handler)
+app.router.add_get('/voice', twilio_voice_handler)  # Telnyx TeXML may use GET
+app.router.add_post('/voice/status', twilio_status_handler)
+app.router.add_post('/telnyx/webhook', telnyx_webhook_handler)
 app.router.add_post('/upload-recording', upload_recording)
 app.router.add_post('/log-metrics', log_metrics)
 app.router.add_get('/stream', stream_handler)

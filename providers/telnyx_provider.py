@@ -101,6 +101,7 @@ class TelnyxProvider(BaseCallingProvider):
     def initiate_outbound_call(self, to_number: str, room_name: str, should_record: bool, callback_url: str):
         """
         Makes an outbound call using Telnyx Call Control and pulls them into a conference room.
+        For Telnyx, we need to use answer_url instead of connection_url for outbound calls.
         """
         print(f"[Telnyx] Initiating outbound call to {to_number} to join room {room_name}")
 
@@ -110,12 +111,13 @@ class TelnyxProvider(BaseCallingProvider):
         final_url = f"{callback_url}{separator}room={room_name}&record={'true' if should_record else 'false'}"
 
         try:
-            # Use the new client-based approach for SDK 4.90.0
+            # For outbound calls, use answer_url which is called when the call is answered
             call = self.client.calls.create(
                 to=to_number,
                 from_=self._caller_id,
                 connection_id=self.connection_id,
-                connection_url=final_url
+                answer_url=final_url,
+                answer_method="POST"
             )
             # The returned object structure might have changed slightly
             call_control_id = getattr(call.data, 'call_control_id', None) or getattr(call, 'call_control_id', None)

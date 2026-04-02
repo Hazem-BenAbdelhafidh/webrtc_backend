@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calling App Dashboard</title>
+    <!-- Twilio Voice SDK -->
+    <script type="text/javascript" src="https://sdk.twilio.com/js/voice/releases/2.10.1/twilio.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f0f2f5;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: #fff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        h1 {
+            border-bottom: 2px solid #007AFF;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        .controls {
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+        button {
+            background-color: #007AFF;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        button.hangup {
+            background-color: #FF3B30;
+        }
+        button.hangup:hover {
+            background-color: #c92a21;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        .rooms {
+            list-style: none;
+            padding: 0;
+        }
+        .room-card {
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 8px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .status-box {
+            margin-top: 20px;
+            padding: 15px;
+            background: #e9ecef;
+            border-radius: 8px;
+            font-family: monospace;
+        }
+        input[type="text"] {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>Live Conferences Dashboard</h1>
+    
+    <div class="controls">
+        <button onclick="fetchRooms()">Refresh Calls</button>
+        <div id="callControls" style="display: none;">
+            <span id="currentCallText" style="font-weight: bold; margin-right: 15px;"></span>
+            <button class="hangup" onclick="hangupCall()">Hang Up</button>
+        </div>
+    </div>
+
+    <div class="controls" style="border-top: 1px solid #eee; padding-top: 15px;">
+        <input type="text" id="customDialInput" placeholder="Enter room or number">
+        <button onclick="dialCustom()">Dial Custom</button>
+    </div>
+
+    <ul class="rooms" id="roomsList">
+        <!-- Rooms will be injected here -->
+    </ul>
+
+    <div class="status-box">
+        <strong>Status:</strong> <span id="statusText">Ready / Disconnected</span>
+    </div>
+</div>
+
+<script>
+    let device;
+    let currentConnection;
+    let isDeviceReady = false;
+
+    function setStatus(msg) {
+        document.getElementById('statusText').innerText = msg;
+    }
+
+    async function fetchRooms() {
+        try {
+            const res = await fetch('/active-calls');
+            const rooms = await res.json();
+            const list = document.getElementById('roomsList');
+            list.innerHTML = '';
+            
+            if (rooms.length === 0) {
+                list.innerHTML = '<li style="color: #666;">No active calls right now.</li>';
+                return;
+            }
+
+            rooms.forEach(room => {
+                const li = document.createElement('li');
+                li.className = 'room-card';
+                
+                const minutes = Math.floor(room.duration / 60);
+                const seconds = String(room.duration % 60).padStart(2, '0');
+
+                li.innerHTML = `
+                    <div>
+                        <strong>Room: ${room.room_name}</strong><br>
+                        <small>Participants: ${room.participant_count} | Duration: ${minutes}:${seconds}</small>
+                    </div>
+                    <button onclick="joinRoom('${room.room_name}')">Join Call</button>
+                `;
+                list.appendChild(li);
+            });
+        } catch (e) {
+            setStatus('Failed to fetch rooms');
+            console.error(e);
+        }
+    }
+
+    async function initializeDevice() {
+        if (isDeviceReady) return true;
+        setStatus('Fetching token...');
+        try {
+            const identity = 'web_user_' + Math.floor(Math.random() * 1000);
+            const res = await fetch(`/token?identity=${identity}`);
+            const data = await res.json();
+            
+            if (!data.token) throw new Error("No token received");
+
+            setStatus('Initializing Twilio WebRTC...');
+            device = new Twilio.Device(data.token, {
+                codecPreferences: ['opus', 'pcmu'],
+                fakeLocalDTMF: true,
+                enableRingingState: true
+            });
+
+            device.on('error', function (twilioError) {
+                setStatus('Device Error: ' + twilioError.message);
+            });
+
+            // Automatically register device
+            await device.register();
+            isDeviceReady = true;
+            setStatus('Device Ready');
+            return true;
+        } catch (e) {
+            setStatus('Error initializing: ' + e.message);
+            console.error(e);
+            return false;
+        }
+    }
+
+    async function joinRoom(roomName) {
+        if (!currentConnection) {
+            const ready = await initializeDevice();
+            if (!ready) return;
+        }
+
+        setStatus(`Connecting to ${roomName}...`);
+        
+        try {
+            // Initiate the call
+            const call = await device.connect({ params: { To: roomName } });
+            
+            call.on('accept', () => {
+                setStatus('Call Connected');
+                document.getElementById('callControls').style.display = 'inline-block';
+                document.getElementById('currentCallText').innerText = `Active Call: ${roomName}`;
+                currentConnection = call;
+            });
+
+            call.on('disconnect', () => {
+                setStatus('Call Disconnected');
+                hideCallControls();
+            });
+
+            call.on('cancel', () => {
+                setStatus('Call Canceled');
+                hideCallControls();
+            });
+            
+            call.on('reject', () => {
+                setStatus('Call Rejected');
+                hideCallControls();
+            });
+            
+            // For older SDKs or immediate connection
+            if (call.status() === 'open') {
+                document.getElementById('callControls').style.display = 'inline-block';
+                document.getElementById('currentCallText').innerText = `Active Call: ${roomName}`;
+                currentConnection = call;
+            }
+
+        } catch (e) {
+            setStatus('Call connection failed: ' + e.message);
+        }
+    }
+
+    function dialCustom() {
+        const to = document.getElementById('customDialInput').value.trim();
+        if (to) {
+            joinRoom(to);
+        }
+    }
+
+    function hangupCall() {
+        if (device) {
+            device.disconnectAll();
+        }
+        hideCallControls();
+        setStatus('Call Hung Up');
+    }
+
+    function hideCallControls() {
+        document.getElementById('callControls').style.display = 'none';
+        currentConnection = null;
+        setTimeout(fetchRooms, 1500); // refresh list smoothly after hangup
+    }
+
+    // Polling rooms
+    fetchRooms();
+    setInterval(fetchRooms, 10000);
+</script>
+</body>
+</html>
